@@ -1,5 +1,5 @@
 
---imgui over nw and cairo integration.
+--imgui nw+cairo driver.
 --Written by Cosmin Apreutesei. Public Domain.
 
 if not ... then require'imgui_demo'; return end
@@ -7,14 +7,17 @@ if not ... then require'imgui_demo'; return end
 local imgui = require'imgui'
 local nw = require'nw'
 local cairo = require'cairo'
+local freetype = require'freetype'
 local time = require'time'
+local gfonts = require'gfonts'
 
 local imgui_nw_cairo = {}
 
 local app = nw:app()
+local ft = freetype:new()
 
 local function fps_function()
-	local count_per_sec = 2
+	local count_per_sec = 1
 	local frame_count, last_frame_count, last_time = 0, 0
 	return function()
 		last_time = last_time or time.clock()
@@ -28,15 +31,9 @@ local function fps_function()
 	end
 end
 
-function imgui_nw_cairo:bind_window(win, imgui_instance)
+function imgui_nw_cairo:bind(win, imgui_class)
 
-	local imgui = imgui_instance or imgui:new()
-
-	--mouse state
-	imgui.mousex = win:mouse'x' or 0
-	imgui.mousey = win:mouse'y' or 0
-	imgui.lbutton = win:mouse'left'
-	imgui.rbutton = win:mouse'right'
+	local imgui = (imgui_class or imgui):new()
 
 	function imgui:window()
 		return win
@@ -45,11 +42,30 @@ function imgui_nw_cairo:bind_window(win, imgui_instance)
 	function win:imgui()
 		return imgui
 	end
-	function imgui:render() end --stub, user app code event
 
-	function imgui:_backend_render_frame()
-		imgui:render()
-		win:fire('imgui_render', imgui)
+	function imgui:unbind()
+		win:off'.imgui'
+		win.imgui = nil
+	end
+
+	function imgui:_backend_clock()
+		return time.clock()
+	end
+
+	function imgui:_backend_mouse_state()
+		return
+			win:mouse'x',
+			win:mouse'y',
+			win:mouse'left',
+			win:mouse'right'
+	end
+
+	function imgui:_backend_key_state(keyname)
+		return app:key(keyname)
+	end
+
+	function imgui:_backend_client_size()
+		return win:client_size()
 	end
 
 	local fps = fps_function()
@@ -66,59 +82,70 @@ function imgui_nw_cairo:bind_window(win, imgui_instance)
 		win:cursor(cursor or 'arrow')
 	end
 
-	function imgui:_backend_clock()
-		return time.clock()
+	function imgui:_backend_render_frame()
+		win:fire('imgui_render', imgui)
 	end
 
-	function imgui:_backend_keypressed(keyname)
-		return app:key(keyname)
-	end
-
-	win:on('repaint', function(self)
-
-		imgui.cw, imgui.ch = self:client_size()
-
+	win:on('repaint.imgui', function(self)
 		local bmp = self:bitmap()
 		local cr = bmp:cairo()
 		imgui.cr = cr
-
-		imgui:_render_frame()
-
-		--set the window title
-		local title = imgui.title
-			or string.format('Cairo %s', cairo.version_string())
-		if imgui.continuous_rendering then
-			title = string.format('%s - %d fps', title, fps())
-		end
-		self:title(title)
-
-		--set the cursor
-		self:cursor(imgui.cursor or 'arrow')
-
+		imgui:_render_frame(cr)
 	end)
 
-	win:on('mousemove', function(self, x, y)
-		imgui.mousex = x
-		imgui.mousey = y
-		self:invalidate()
-	end)
-
-	local function mousemove(self, x, y)
-		imgui.mousex = x
-		imgui.mousey = y
-		imgui.lbutton = self:mouse'left'
-		imgui.rbutton = self:mouse'right'
-		self:invalidate()
+	--stub file-finding implementation based on gfonts module
+	function win:imgui_find_font_file(name, weight, slant)
+		return gfonts.font_file(name, weight, slant)
+		--local file = string.format('media/fonts/%s.ttf', name)
 	end
 
-	win:on('mousemove', mousemove)
-	win:on('mouseenter', mousemove)
+	local cache = {} --{name -> face}
+	local cur_id, cur_face
+	function imgui:_backend_load_font(name, weight, slant)
+		if not name then
+			self.cr:font_face(cairo.NULL)
+			cur_id, cur_face = nil
+			return
+		end
+		local id =
+			name:lower() .. '|' ..
+			tostring(weight):lower() .. '|'
+			.. slant:lower()
+		if cur_id == id then
+			return
+		end
+		local face = cache[id]
+		if face == nil then
+			local file = win:imgui_find_font_file(name, weight, slant)
+			if file then
+				local ft_face = ft:face(file)
+				face = cairo.ft_font_face(ft_face) -- TODO: weight, slant
+				cache[id] = face
+			else
+				cache[id] = false
+			end
+		end
+		if face then
+			self.cr:font_face(face)
+			cur_id, cur_face = id, face
+		end
+	end
 
-	win:on('mouseleave', function(self)
+	win:on('mousemove.imgui', function(self, x, y)
+		imgui:_backend_event('_backend_mousemove', x, y)
 		self:invalidate()
 	end)
 
-	win:on('mousedown', function(self, button, x, y)
+	win:on('mouseenter.imgui', function(self, x, y)
+		imgui:_backend_event('_backend_mouseenter', x, y)
+		self:invalidate()
+	end)
+
+	win:on('mouseleave.imgui', function(self)
+		self:invalidate()
+	end)
+
+	win:on('mousedown.imgui', function(self, button, x, y)
 		if button == 'left' then
 			if not imgui.lbutton then
 				imgui.lpressed = true
@@ -136,7 +163,7 @@ function imgui_nw_cairo:bind_window(win, imgui_instance)
 		end
 	end)
 
-	win:on('mouseup', function(self, button, x, y)
+	win:on('mouseup.imgui', function(self, button, x, y)
 		if button == 'left' then
 			imgui.lpressed = false
 			imgui.lbutton = false
@@ -150,7 +177,7 @@ function imgui_nw_cairo:bind_window(win, imgui_instance)
 		end
 	end)
 
-	win:on('click', function(self, button, count, x, y)
+	win:on('click.imgui', function(self, button, count, x, y)
 		if count == 2 then
 			imgui.doubleclicked = true
 			self:invalidate()
@@ -164,7 +191,7 @@ function imgui_nw_cairo:bind_window(win, imgui_instance)
 		end
 	end)
 
-	win:on('mousewheel', function(self, delta, x, y)
+	win:on('mousewheel.imgui', function(self, delta, x, y)
 		imgui.wheel_delta = imgui.wheel_delta + (delta / 120 or 0)
 		self:invalidate()
 	end)
@@ -176,13 +203,13 @@ function imgui_nw_cairo:bind_window(win, imgui_instance)
 		imgui.alt = app:key'alt'
 		self:invalidate()
 	end
-	win:on('keydown', function(self, key)
+	win:on('keydown.imgui', function(self, key)
 		key_event(self, key, true)
 	end)
-	win:on('keyup', function(self, key)
+	win:on('keyup.imgui', function(self, key)
 		key_event(self, key, false)
 	end)
-	win:on('keypress', function(self, key)
+	win:on('keypress.imgui', function(self, key)
 		key_event(self, key, true)
 	end)
 
@@ -190,7 +217,7 @@ function imgui_nw_cairo:bind_window(win, imgui_instance)
 		imgui.char = down and char or nil
 		self:invalidate()
 	end
-	win:on('keychar', function(self, char)
+	win:on('keychar.imgui', function(self, char)
 		key_char_event(self, char, true)
 	end)
 
@@ -201,6 +228,10 @@ function imgui_nw_cairo:bind_window(win, imgui_instance)
 	end)
 
 	return imgui
+end
+
+function imgui_nw_cairo:unbind(win)
+	win:imgui():unbind()
 end
 
 return imgui_nw_cairo
